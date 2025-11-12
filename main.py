@@ -8,6 +8,7 @@ import socket
 import sys
 import time
 import math
+import json
 from collections import deque
 
 try:
@@ -16,12 +17,17 @@ except Exception as e:
     print("Missing vgamepad. Install with: pip install vgamepad")
     raise e
 
+try:
+    import pydirectinput
+except Exception as e:
+    print("Missing pydirectinput. Install with: pip install pydirectinput")
+    raise e
+
 # Configuration constants
 UDP_IP = "0.0.0.0"  # Listen on all network interfaces
 UDP_PORT = 5555     # Default port
-STEERING_SENSITIVITY = 2.0  # Multiplier for gyro to steering conversion
 STEERING_DEADZONE = 5       # Degrees - ignore small movements
-MAX_STEERING_ANGLE = 45     # Degrees - maximum steering angle
+MAX_STEERING_ANGLE = 90     # Degrees - ESP32 sends -90 to +90
 BUFFER_SIZE = 5             # Number of samples for smoothing
 SMOOTHING_ALPHA = 0.7       # Exponential smoothing factor (0-1)
 
@@ -40,13 +46,19 @@ class GyroSteeringController:
         self.smoothed_steering = 0.0
         self.last_data_time = time.time()
         
-        # Calibration
-        self.calibration_offset = 0.0
-        self.is_calibrated = False
+        # Gear state
+        self.current_gear = 0
+        self.last_gear_shift_time = 0.0
+        self.gear_shift_cooldown = 0.2  # 200ms cooldown between gear shifts
+        
+        # Control state
+        self.last_accel = False
+        self.last_brake = False
         
         # Statistics
         self.packet_count = 0
         self.last_status_time = time.time()
+        self.last_debug_time = time.time()
         
         self.setup_socket()
     
@@ -72,45 +84,52 @@ class GyroSteeringController:
             print(f"Could not determine IP addresses: {e}")
         return ip_addresses
     
-    def parse_gyro_data(self, message):
-        """Parse ESP32 gyro data in format X:val|Y:val|Z:val"""
+    def parse_control_data(self, message):
+        """Parse ESP32 control data in JSON format"""
         try:
-            parts = message.split('|')
-            roll = int(parts[0].split(':')[1])   # X - Roll (steering)
-            pitch = int(parts[1].split(':')[1])  # Y - Pitch (not used)
-            yaw = int(parts[2].split(':')[1])    # Z - Yaw (not used)
-            return roll, pitch, yaw
-        except (IndexError, ValueError) as e:
-            print(f"Error parsing gyro data: {message} ({e})")
-            return None, None, None
+            # Try JSON parsing first
+            data = json.loads(message)
+            
+            # Extract steering values
+            steering = data.get("steering", {})
+            x = steering.get("x", 0.0)
+            y = steering.get("y", 0.0)
+            z = steering.get("z", 0.0)  # This is our yaw/steering value
+            
+            # Extract control values
+            gear = data.get("gear", 0)
+            accel = data.get("accel", False)
+            brake = data.get("brake", False)
+            
+            return x, y, z, gear, accel, brake
+            
+        except json.JSONDecodeError:
+            # Fallback to old format for backward compatibility
+            try:
+                parts = message.split('|')
+                roll = int(parts[0].split(':')[1])   # X - Roll (not used)
+                pitch = int(parts[1].split(':')[1])  # Y - Pitch (not used)
+                yaw = int(parts[2].split(':')[1])    # Z - Yaw (steering)
+                return roll, pitch, yaw, 0, False, False
+            except (IndexError, ValueError) as e:
+                print(f"Error parsing control data: {message} ({e})")
+                return None, None, None, None, None, None
+        except Exception as e:
+            print(f"Error parsing JSON data: {message} ({e})")
+            return None, None, None, None, None, None
     
-    def calibrate_steering(self, roll_value):
-        """Calibrate the neutral steering position"""
-        if not self.is_calibrated:
-            self.calibration_offset = roll_value
-            self.is_calibrated = True
-            print(f"🎯 Steering calibrated! Neutral position: {roll_value}°")
-            return True
-        return False
-    
-    def calculate_steering(self, roll_value):
-        """Convert gyro roll to steering value (-1.0 to 1.0)"""
-        if not self.is_calibrated:
-            return 0.0
-        
-        # Apply calibration offset
-        adjusted_roll = roll_value - self.calibration_offset
-        
+    def calculate_steering(self, yaw_value):
+        """Convert gyro yaw to steering value (-1.0 to 1.0)"""
+        # ESP32 sends -90 to +90, map directly to -1.0 to +1.0
         # Apply deadzone
-        if abs(adjusted_roll) < STEERING_DEADZONE:
-            adjusted_roll = 0.0
+        if abs(yaw_value) < STEERING_DEADZONE:
+            yaw_value = 0.0
         
-        # Clamp to maximum angle
-        adjusted_roll = max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, adjusted_roll))
+        # Clamp to expected range (-90 to +90)
+        clamped_yaw = max(-MAX_STEERING_ANGLE, min(MAX_STEERING_ANGLE, yaw_value))
         
-        # Convert to steering value (-1.0 to 1.0)
-        steering = (adjusted_roll / MAX_STEERING_ANGLE) * STEERING_SENSITIVITY
-        steering = max(-1.0, min(1.0, steering))
+        # Convert directly: -90 -> -1.0, +90 -> +1.0
+        steering = clamped_yaw / MAX_STEERING_ANGLE
         
         return steering
     
@@ -120,24 +139,73 @@ class GyroSteeringController:
                                  (1 - SMOOTHING_ALPHA) * self.smoothed_steering)
         return self.smoothed_steering
     
-    def send_steering_to_gamepad(self, steering_value):
-        """Send steering value to virtual Xbox controller"""
+    def handle_gear_shift(self, new_gear):
+        """Handle gear shifting with keyboard controls and cooldown"""
+        current_time = time.time()
+        
+        # Check cooldown
+        if current_time - self.last_gear_shift_time < self.gear_shift_cooldown:
+            return
+        
+        # Compare with current gear
+        if new_gear > self.current_gear:
+            # Shift up - press 's'
+            pydirectinput.press('s')
+            self.last_gear_shift_time = current_time
+            self.current_gear = new_gear
+        elif new_gear < self.current_gear:
+            # Shift down - press 'x'
+            pydirectinput.press('x')
+            self.last_gear_shift_time = current_time
+            self.current_gear = new_gear
+    
+    def send_controls_to_gamepad(self, steering_value, accel, brake):
+        """Send all control values to virtual Xbox controller"""
         try:
-            # Only steering for now - no throttle/brake
+            # Steering
             self.gamepad.left_joystick_float(steering_value, 0.0)
+            
+            # Throttle (right trigger)
+            throttle_value = 1.0 if accel else 0.0
+            self.gamepad.right_trigger_float(throttle_value)
+            
+            # Brake (left trigger)
+            brake_value = 1.0 if brake else 0.0
+            self.gamepad.left_trigger_float(brake_value)
+            
             self.gamepad.update()
         except Exception as e:
             print(f"Error sending to gamepad: {e}")
     
-    def display_status(self, roll, pitch, yaw, steering):
+    def reset_to_safe_state(self):
+        """Reset all controls to neutral/safe state"""
+        try:
+            self.gamepad.left_joystick_float(0.0, 0.0)  # Center steering
+            self.gamepad.right_trigger_float(0.0)       # Release throttle
+            self.gamepad.left_trigger_float(0.0)        # Release brake
+            self.gamepad.update()
+            self.smoothed_steering = 0.0
+        except Exception as e:
+            print(f"Error resetting to safe state: {e}")
+    
+    def display_status(self, x, y, z, steering, gear, accel, brake):
         """Display current status"""
         status_line = (f"[{self.packet_count:06d}] "
-                      f"Roll: {roll:4d}° | "
+                      f"Z: {z:6.1f}° | "
                       f"Steering: {steering:+.3f} | "
-                      f"Calibrated: {'✓' if self.is_calibrated else '✗'}")
+                      f"Gear: {gear} | "
+                      f"Accel: {int(accel)} | "
+                      f"Brake: {int(brake)}")
         
         # Clear line and print status
         print(f"\r{status_line}", end="", flush=True)
+    
+    def display_debug_info(self, gear, accel, brake, steering):
+        """Display debug information every 0.5 seconds"""
+        current_time = time.time()
+        if current_time - self.last_debug_time >= 0.5:
+            print(f"\n[DEBUG] GEAR: {gear} | ACCEL: {int(accel)} | BRAKE: {int(brake)} | STEER: {steering:.2f}")
+            self.last_debug_time = current_time
     
     def run(self):
         """Main control loop"""
@@ -161,8 +229,8 @@ class GyroSteeringController:
         
         print("\n🎮 Controls:")
         print("  - Tilt steering wheel left/right to steer")
-        print("  - Press 'c' to calibrate neutral position")
-        print("  - Press 'q' to quit")
+        print("  - Accelerator/Brake buttons for throttle/brake")
+        print("  - Gear changes trigger 's' (up) / 'x' (down) keys")
         print("  - Ctrl+C to exit")
         
         print("\n" + "=" * 70)
@@ -176,34 +244,37 @@ class GyroSteeringController:
                     self.packet_count += 1
                     self.last_data_time = time.time()
                     
-                    # Parse gyro data
+                    # Parse control data (JSON or legacy format)
                     message = data.decode('utf-8').strip()
-                    roll, pitch, yaw = self.parse_gyro_data(message)
+                    x, y, z, gear, accel, brake = self.parse_control_data(message)
                     
-                    if roll is not None:
-                        # Auto-calibrate on first packet
-                        if not self.is_calibrated:
-                            self.calibrate_steering(roll)
-                        
-                        # Calculate steering
-                        raw_steering = self.calculate_steering(roll)
+                    if z is not None:
+                        # Calculate steering from ESP32 z values (yaw, -90 to +90)
+                        raw_steering = self.calculate_steering(z)
                         smoothed_steering = self.apply_smoothing(raw_steering)
                         
-                        # Send to gamepad
-                        self.send_steering_to_gamepad(smoothed_steering)
+                        # Handle gear shifting
+                        if gear is not None:
+                            self.handle_gear_shift(gear)
+                        
+                        # Send all controls to gamepad
+                        self.send_controls_to_gamepad(smoothed_steering, accel, brake)
                         
                         # Display status
-                        self.display_status(roll, pitch, yaw, smoothed_steering)
+                        self.display_status(x, y, z, smoothed_steering, gear, accel, brake)
+                        
+                        # Display debug info every 0.5s
+                        self.display_debug_info(gear, accel, brake, smoothed_steering)
                 
                 except socket.timeout:
                     # Check for connection loss
                     current_time = time.time()
-                    if current_time - self.last_data_time > 2.0:
-                        # No data for 2 seconds - center steering
-                        self.send_steering_to_gamepad(0.0)
+                    if current_time - self.last_data_time > 0.3:  # 300ms timeout
+                        # No data for 300ms - enter safe state
+                        self.reset_to_safe_state()
                         
-                        if current_time - self.last_status_time > 5.0:
-                            print(f"\n[Status] No data received. Packets: {self.packet_count}")
+                        if current_time - self.last_status_time > 1.0:
+                            print(f"\n[WARN] No UDP data — entering safe state. Packets: {self.packet_count}")
                             self.last_status_time = current_time
                     continue
                 
@@ -258,19 +329,6 @@ def main():
         print(f"Error: {e}")
         return 1
     
-    return 0
-
-if __name__ == "__main__":
-    exit(main())
-
-def main():
-    """Main entry point"""
-    try:
-        controller = HandGestureController()
-        controller.run()
-    except Exception as e:
-        print(f"Error: {e}")
-        return 1
     return 0
 
 if __name__ == "__main__":
